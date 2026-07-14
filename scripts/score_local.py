@@ -31,6 +31,9 @@ Usage:
   # smaller model to sanity-check the pipeline without 64GB of VRAM:
   python scripts/score_local.py "hi" --model meta-llama/Llama-3.1-8B --layer 16 \
       --d data/directions/d_llama_v1.npz --probes data/probes/season1.json --device cpu
+  # batch mode: score every prompt in a JSON list and write a report comparing
+  # against any "score" field (e.g. ground-truth website scores):
+  python scripts/score_local.py --prompts-json prompts.json --report report.json
 """
 
 from __future__ import annotations
@@ -65,16 +68,27 @@ def compose(seq: str, probe: str) -> str:
     return f"{seq} {probe}"
 
 
+def load_prompts_json(path: str) -> list[dict]:
+    """Load a JSON list of {"prompt": str, "score": float (optional)} records."""
+    obj = json.loads(Path(path).read_text(encoding="utf-8"))
+    return [x if isinstance(x, dict) else {"prompt": x} for x in obj]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Local (no-NDIF) Steering Arena scorer.")
-    ap.add_argument("sequence")
+    ap.add_argument("sequence", nargs="?", help="single sequence to score (omit when using --prompts-json)")
     ap.add_argument("--model", default="allenai/Olmo-3-1125-32B")
     ap.add_argument("--layer", type=int, default=24)
     ap.add_argument("--d", default="data/directions/d_olmo3_L24_logistic.npz")
     ap.add_argument("--probes", default="data/probes/season2.json")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     ap.add_argument("--device", default="auto", help="'auto' (accelerate), 'cuda', or 'cpu'")
+    ap.add_argument("--prompts-json", help="Filepath to JSON list of {prompt, score?} to batch-score")
+    ap.add_argument("--report", help="write batch results to this JSON path")
     args = ap.parse_args()
+
+    if not args.sequence and not args.prompts_json:
+        ap.error("provide a sequence argument or --prompts-json")
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -110,10 +124,39 @@ def main():
 
     # Baselines depend only on the probe, so compute them once (matches the server).
     base = {p: cosine(resid_last(p), d) for p in probes}
-    shifts = [cosine(resid_last(compose(args.sequence, p)), d) - base[p] for p in probes]
-    score = float(np.mean(shifts))
+
+    def score_of(seq: str) -> float:
+        shifts = [cosine(resid_last(compose(seq, p)), d) - base[p] for p in probes]
+        return float(np.mean(shifts))
 
     print(f"model={args.model} layer={args.layer} dtype={args.dtype} probes={len(probes)}")
+
+    if args.prompts_json:
+        records = load_prompts_json(args.prompts_json)
+        results = []
+        for rec in records:
+            prompt = rec["prompt"]
+            local = score_of(prompt)
+            gt = rec.get("score")
+            diff = (local - gt) if gt is not None else None
+            results.append({"prompt": prompt, "ground_truth": gt, "local_score": local, "diff": diff})
+            gt_str = f"{gt:+.4f}" if gt is not None else "   n/a"
+            diff_str = f"{diff:+.4f}" if diff is not None else "  n/a"
+            print(f"  local={local:+.6f}  gt={gt_str}  diff={diff_str}  {prompt!r}")
+        report = {
+            "model": args.model,
+            "layer": args.layer,
+            "dtype": args.dtype,
+            "direction": args.d,
+            "probes": args.probes,
+            "results": results,
+        }
+        if args.report:
+            Path(args.report).write_text(json.dumps(report, indent=2), encoding="utf-8")
+            print(f"wrote report to {args.report}")
+        return
+
+    score = score_of(args.sequence)
     print(f"score (mean cosine steering-shift): {score:+.6f}")
     print("note: server (NDIF) score is canonical for the leaderboard; local may differ "
           "slightly by precision/hardware.")
